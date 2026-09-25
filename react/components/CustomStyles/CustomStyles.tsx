@@ -4,6 +4,7 @@ import styles from "./CustomStyles.css";
 
 const RG_INPUT_ID = "custom-rg-input";
 const ORGAO_INPUT_ID = "custom-orgao-input";
+const CPF_INPUT_ID = "custom-cpf-input";
 const WRAPPER_ID = "custom-extra-docs";
 
 // Máscara de RG: 00.000.000-0 (até 9 caracteres; o dígito final pode ser X)
@@ -21,17 +22,28 @@ function maskRg(value: string) {
     .replace(/^(\d{2}\.\d{3}\.\d{3})([0-9X])/, "$1-$2");
 }
 
+// Máscara CPF: 000.000.000-00
+function maskCpf(value: string) {
+  return value
+    .replace(/\D/g, "")
+    .slice(0, 11)
+    .replace(/(\d{3})(\d)/, "$1.$2")
+    .replace(/(\d{3}\.\d{3})(\d)/, "$1.$2")
+    .replace(/(\d{3}\.\d{3}\.\d{3})(\d{1,2})/, "$1-$2");
+}
+
 // Busca rg/orgaoExpedidor do cadastro (CL) do usuário logado.
 // O safedata devolve apenas os dados do próprio usuário (escopo do cookie).
 let extraDocsPromise: Promise<{
   rg?: string;
   orgaoExpedidor?: string;
+  cpf?: string;
 } | null> | null = null;
 
 function fetchExtraDocs() {
   if (!extraDocsPromise) {
     extraDocsPromise = fetch(
-      "/api/io/safedata/CL/search?_fields=rg,orgaoExpedidor&_limit=1",
+      "/api/io/safedata/CL/search?_fields=rg,orgaoExpedidor,cpf&_limit=1",
       {
         credentials: "include",
         headers: {
@@ -51,6 +63,60 @@ function fetchExtraDocs() {
   return extraDocsPromise;
 }
 
+function findCpfInput(): HTMLInputElement | null {
+  const inputs = Array.from(document.querySelectorAll("input")) as HTMLInputElement[];
+
+  // 1) Prefere input com name="document" (usado pelo storefront)
+  const byDocumentName = inputs.find((i) => i.name && i.name.toLowerCase() === "document");
+  if (byDocumentName) return byDocumentName;
+
+  // 2) Prefere inputs cujo id/name contenha "cpf"
+  const byIdOrName = inputs.find(
+    (i) => (i.id && i.id.toLowerCase().includes("cpf")) || (i.name && i.name.toLowerCase().includes("cpf"))
+  );
+  if (byIdOrName) return byIdOrName;
+
+  // 3) procura por label/elemento cujo texto contenha CPF e pega o input filho
+  const labelElems = Array.from(document.querySelectorAll("label, span, div"));
+  for (const lab of labelElems) {
+    const text = (lab.textContent || "").toLowerCase();
+    if (text.includes("cpf")) {
+      const input = lab.querySelector("input") as HTMLInputElement | null;
+      if (input) return input;
+    }
+  }
+
+  // 4) última tentativa: placeholder com padrão de CPF (000)
+  const byPlaceholder = inputs.find((i) => (i.placeholder || "").toLowerCase().includes("000"));
+  if (byPlaceholder) return byPlaceholder;
+
+  // 5) fallback: qualquer input que já tenha valor (evita pegar input vazio injetado)
+  const alreadyFilled = inputs.find((i) => (i.value || i.getAttribute("value") || "").toString().trim().length > 0);
+  return alreadyFilled || null;
+}
+
+function findRgInput(): HTMLInputElement | null {
+  const inputs = Array.from(document.querySelectorAll("input")) as HTMLInputElement[];
+
+  const byIdOrName = inputs.find(
+    (i) => (i.id && i.id.toLowerCase().includes("rg")) || (i.name && i.name.toLowerCase().includes("rg"))
+  );
+
+  if (byIdOrName) return byIdOrName;
+
+  // procura por label cujo texto contenha RG e pega o input filho
+  const labels = Array.from(document.querySelectorAll("label, span, div"));
+  for (const lab of labels) {
+    const text = (lab.textContent || "").toLowerCase();
+    if (text.includes("rg")) {
+      const input = (lab.querySelector("input") as HTMLInputElement | null) || null;
+      if (input) return input;
+    }
+  }
+
+  return null;
+}
+
 // Salva na CL via safedata. Fora do checkout não há vtexjs, então o
 // orderFormId e o e-mail (exigidos pelo PATCH) vêm da API de orderForm,
 // que já retorna o perfil preenchido para usuário logado.
@@ -59,10 +125,12 @@ async function saveExtraDocs() {
   const oeEl = document.getElementById(
     ORGAO_INPUT_ID
   ) as HTMLInputElement | null;
+  const cpfEl = (document.getElementById(CPF_INPUT_ID) as HTMLInputElement | null) || findCpfInput();
   const rg = ((rgEl && rgEl.value) || "").trim();
   const orgao = ((oeEl && oeEl.value) || "").trim();
+  const cpf = ((cpfEl && cpfEl.value) || "").trim();
 
-  if (!rg && !orgao) return;
+  if (!rg && !orgao && !cpf) return;
 
   try {
     const of = await fetch("/api/checkout/pub/orderForm", {
@@ -88,6 +156,10 @@ async function saveExtraDocs() {
 
     if (!orderFormId || !email) return;
 
+    // normaliza valores (remove máscara) antes de enviar
+    const cpfDigits = (cpf || "").replace(/\D/g, "");
+    const rgNormalized = (rg || "").toUpperCase().replace(/[^0-9X]/g, "");
+
     const res = await fetch(
       `/api/io/safedata/CL/documents?_orderFormId=${encodeURIComponent(
         orderFormId
@@ -99,7 +171,7 @@ async function saveExtraDocs() {
           "Content-Type": "application/json",
           Accept: "application/json",
         },
-        body: JSON.stringify({ email, rg, orgaoExpedidor: orgao }),
+        body: JSON.stringify({ email, rg: rgNormalized, orgaoExpedidor: orgao, cpf: cpfDigits }),
       }
     );
 
@@ -116,13 +188,51 @@ async function saveExtraDocs() {
 // Cria os campos logo após o bloco da data de nascimento (idempotente)
 // e pré-preenche com o que existir no cadastro.
 function ensureExtraDocsFields(anchor: Element) {
-  if (document.getElementById(WRAPPER_ID)) return;
+  // se já injetamos antes, apenas sincroniza/remova cpf injetado se necessário
+  const existingWrapper = document.getElementById(WRAPPER_ID);
+  const existingCpf = findCpfInput();
+
+  // detecta qualquer rótulo/texto visível indicando CPF — cobre casos onde o input não tem id/name com "cpf"
+  const hasLabelCpf = Array.from(document.querySelectorAll("label,div,span,legend"))
+    .some((el) => (el.textContent || "").toLowerCase().includes("cpf"));
+
+  if (existingWrapper) {
+    // se já existe um CPF fora do nosso wrapper, remove o CPF injetado dentro do wrapper para evitar duplicação
+    if (existingCpf && document.getElementById(CPF_INPUT_ID)) {
+      const injected = document.getElementById(CPF_INPUT_ID);
+      const injectedErr = document.getElementById(`error-${CPF_INPUT_ID}`);
+      if (injected) injected.remove();
+      if (injectedErr) injectedErr.remove();
+    }
+
+    return;
+  }
+
+  // decide se deve inserir o campo CPF: se já houver rótulo/field CPF, não injeta
+  const shouldInjectCpf = !existingCpf && !hasLabelCpf;
+
+  // se existir CPF nativo, força atributo required para ajudar validação nativa
+  if (existingCpf) {
+    try {
+      existingCpf.required = true;
+      existingCpf.setAttribute("aria-required", "true");
+    } catch (e) {}
+  }
+
+  const cpfHtml = shouldInjectCpf
+    ? `<label class="${styles.extraDocsLabel}">CPF` +
+      `<input type=\"text\" id=\"${CPF_INPUT_ID}\" class=\"${styles.extraDocsInput}\" autocomplete=\"off\" maxlength=\"14\" placeholder=\"Ex: 000.000.000-00\">` +
+      `<small id=\"error-${CPF_INPUT_ID}\" class=\"${styles.extraDocsError}\">Este campo é obrigatório.</small>` +
+      `</label>`
+    : "";
 
   anchor.insertAdjacentHTML(
     "afterend",
     `<div id="${WRAPPER_ID}" class="${styles.extraDocsWrapper}">` +
+      cpfHtml +
       `<label class="${styles.extraDocsLabel}">RG` +
       `<input type="text" id="${RG_INPUT_ID}" class="${styles.extraDocsInput}" autocomplete="off" maxlength="12" placeholder="Ex: 00.000.000-0">` +
+      `<small id="error-${RG_INPUT_ID}" class="${styles.extraDocsError}">Este campo é obrigatório.</small>` +
       `</label>` +
       `<label class="${styles.extraDocsLabel}">Órgão expedidor` +
       `<input type="text" id="${ORGAO_INPUT_ID}" class="${styles.extraDocsInput}" autocomplete="off" placeholder="Ex: SSP/SP">` +
@@ -133,9 +243,9 @@ function ensureExtraDocsFields(anchor: Element) {
   fetchExtraDocs().then((doc) => {
     if (!doc) return;
 
-    const rgEl = document.getElementById(
-      RG_INPUT_ID
-    ) as HTMLInputElement | null;
+    const rgEl = (document.getElementById(
+        RG_INPUT_ID
+      ) as HTMLInputElement | null) || findRgInput();
     const oeEl = document.getElementById(
       ORGAO_INPUT_ID
     ) as HTMLInputElement | null;
@@ -143,7 +253,57 @@ function ensureExtraDocsFields(anchor: Element) {
     if (rgEl && doc.rg && !rgEl.value) rgEl.value = maskRg(doc.rg);
     if (oeEl && doc.orgaoExpedidor && !oeEl.value)
       oeEl.value = doc.orgaoExpedidor;
+    const cpfEl = (document.getElementById(CPF_INPUT_ID) as HTMLInputElement | null) || findCpfInput();
+
+    if (cpfEl && doc.cpf && !cpfEl.value) cpfEl.value = maskCpf(doc.cpf);
   });
+}
+
+function validateCpfRgFields() {
+  const cpfInput = (document.getElementById(CPF_INPUT_ID) as HTMLInputElement | null) || findCpfInput();
+  const rgInput = (document.getElementById(RG_INPUT_ID) as HTMLInputElement | null) || findRgInput();
+
+  const getVal = (el: HTMLInputElement | null) => {
+    if (!el) return "";
+    const raw = (el.value || el.getAttribute("value") || "").toString().trim();
+    return raw.replace(/\D/g, "");
+  };
+
+  const cpfVal = getVal(cpfInput);
+  const rgVal = getVal(rgInput);
+
+  let firstInvalid: HTMLInputElement | null = null;
+
+  if (!cpfVal) {
+    firstInvalid = cpfInput || (document.getElementById(CPF_INPUT_ID) as HTMLInputElement | null);
+  }
+
+  if (!rgVal) {
+    firstInvalid = firstInvalid || rgInput;
+  }
+
+  return firstInvalid;
+}
+
+// Remove placeholder "Opcional" de inputs de CPF gerados pelo form padrão
+function removeOptionalPlaceholderForCpf() {
+  try {
+    const labels = Array.from(document.querySelectorAll("label"));
+
+    labels.forEach((lab) => {
+      const text = (lab.textContent || "").toUpperCase();
+
+      if (text.includes("CPF")) {
+        const input = (lab.querySelector("input") as HTMLInputElement) || null;
+
+        if (input && input.placeholder && input.placeholder.toLowerCase().includes("opci")) {
+          input.placeholder = "";
+        }
+      }
+    });
+  } catch (e) {
+    // não falhar se o DOM estiver inconsistente
+  }
 }
 
 const CustomStyles = () => {
@@ -157,6 +317,7 @@ const CustomStyles = () => {
 
       if (birthDateBox) {
         ensureExtraDocsFields(birthDateBox);
+        removeOptionalPlaceholderForCpf();
       }
     });
 
@@ -174,6 +335,22 @@ const CustomStyles = () => {
 
         if (target.value !== masked) target.value = masked;
       }
+
+      if (target && target.id === CPF_INPUT_ID) {
+        const masked = maskCpf(target.value);
+
+        if (target.value !== masked) target.value = masked;
+        // remove possível mensagem de erro ao digitar
+        const err = document.getElementById(`error-${CPF_INPUT_ID}`);
+        if (err) err.style.display = "none";
+        if (target) target.classList.remove(styles.extraDocsInputError);
+      }
+
+      if (target && target.id === RG_INPUT_ID) {
+        const err = document.getElementById(`error-${RG_INPUT_ID}`);
+        if (err) err.style.display = "none";
+        if (target) target.classList.remove(styles.extraDocsInputError);
+      }
     };
 
     // salva ao sair dos campos (mesmo comportamento do script do checkout)
@@ -182,7 +359,9 @@ const CustomStyles = () => {
 
       if (
         target &&
-        (target.id === RG_INPUT_ID || target.id === ORGAO_INPUT_ID)
+        (target.id === RG_INPUT_ID ||
+          target.id === ORGAO_INPUT_ID ||
+          target.id === CPF_INPUT_ID)
       ) {
         saveExtraDocs();
       }
@@ -199,19 +378,86 @@ const CustomStyles = () => {
         target.closest('button[type="submit"]') &&
         document.getElementById(WRAPPER_ID)
       ) {
+        const firstInvalid = validateCpfRgFields();
+
+        if (firstInvalid) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          (ev as any).stopImmediatePropagation && (ev as any).stopImmediatePropagation();
+          alert("Preencha CPF e RG antes de salvar seu perfil.");
+          firstInvalid.focus();
+          return;
+        }
+
         saveExtraDocs();
       }
+    };
+
+    const onPointerDown = (ev: PointerEvent) => {
+      if (!window.location.href.includes("/profile")) return;
+      const target = ev.target as HTMLElement | null;
+
+      if (target && target.closest && target.closest('button[type="submit"]')) {
+        const firstInvalid = validateCpfRgFields();
+        if (firstInvalid) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          (ev as any).stopImmediatePropagation && (ev as any).stopImmediatePropagation();
+          alert("Preencha CPF e RG antes de salvar seu perfil.");
+          firstInvalid.focus();
+          return;
+        }
+      }
+    };
+
+    const onMouseDown = (ev: MouseEvent) => {
+      if (!window.location.href.includes("/profile")) return;
+      const target = ev.target as HTMLElement | null;
+
+      if (target && target.closest && target.closest('button[type="submit"]')) {
+        const firstInvalid = validateCpfRgFields();
+        if (firstInvalid) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          (ev as any).stopImmediatePropagation && (ev as any).stopImmediatePropagation();
+          alert("Preencha CPF e RG antes de salvar seu perfil.");
+          firstInvalid.focus();
+          return;
+        }
+      }
+    };
+
+    // também intercepta submissão de formulários (cobre input[type=submit] e outras formas de envio)
+    const onSubmit = (ev: Event) => {
+      if (!window.location.href.includes("/profile")) return;
+
+      const firstInvalid = validateCpfRgFields();
+      if (firstInvalid) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        alert("Preencha CPF e RG antes de salvar seu perfil.");
+        firstInvalid.focus();
+        return;
+      }
+
+      saveExtraDocs();
     };
 
     document.addEventListener("input", onInput, true);
     document.addEventListener("blur", onBlur, true);
     document.addEventListener("click", onClick, true);
+    document.addEventListener("submit", onSubmit, true);
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("mousedown", onMouseDown, true);
 
     return () => {
       observer.disconnect();
       document.removeEventListener("input", onInput, true);
       document.removeEventListener("blur", onBlur, true);
       document.removeEventListener("click", onClick, true);
+      document.removeEventListener("submit", onSubmit, true);
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("mousedown", onMouseDown, true);
     };
   }, []);
 
